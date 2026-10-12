@@ -334,7 +334,9 @@ class Engine:
         return self._ctx_cache[key]
 
     def _is_successor(self, sid: str) -> bool:
-        return os.environ.get(SUCCESSOR_ENV) == "1" or sid in self.glob.get("successors", [])
+        # sessions[sid]["successor"] is the v0.2.0 location; still honoured.
+        return (os.environ.get(SUCCESSOR_ENV) == "1" or sid in self.glob.get("successors", [])
+                or bool(self.sessions.get(sid, {}).get("successor")))
 
     def on_transform_llm_output(self, response_text: str = "", session_id: str = "",
                                 platform: str = "", **_: Any) -> Optional[str]:
@@ -445,7 +447,8 @@ class Engine:
             self.log("relay_error", session_id=sid, error=str(e))
             return f"\n\n{NOTICE_MARK} Handoff saved, but the fresh session failed to start; {manual}"
         resume = f"hermes -p {profile} -c {name}" if profile and profile != "default" else f"hermes -c {name}"
-        return f"\n\n{NOTICE_MARK} Handoff saved. A fresh session started from it. Continue there with: {resume}"
+        return (f"\n\n{NOTICE_MARK} Handoff saved. A fresh session is starting from it. Continue there with: "
+                f"{resume} (startup log: {out})")
 
 
 def _usable_handoff(hp: Path, armed_at: float) -> bool:
@@ -491,12 +494,15 @@ with open(log_path, "ab") as out:
                 os.killpg(p.pid, sig)
             except ProcessLookupError:
                 return
-            end = time.time() + grace
-            while time.time() < end:
-                try:
-                    p.wait(timeout=0.2)
-                except subprocess.TimeoutExpired:
-                    pass
+            end = time.monotonic() + grace
+            while time.monotonic() < end:
+                if p.poll() is None:
+                    try:
+                        p.wait(timeout=0.2)
+                    except subprocess.TimeoutExpired:
+                        pass
+                else:
+                    time.sleep(0.2)
                 if not group_alive():
                     return
     try:

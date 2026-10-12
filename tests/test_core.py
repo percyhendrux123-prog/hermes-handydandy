@@ -131,7 +131,7 @@ def test_relay_live_spawns_named_successor(tmp_path):
     qf = Path(cmd[cmd.index("--query-file") + 1])
     assert qf.read_text().startswith(f"from handoff {hp}")
     assert "do not send messages" in qf.read_text()
-    assert "hermes -c handydandy-s1" in out
+    assert "hermes -c handydandy-s1" in out and "is starting" in out
 
 
 def test_relay_blocked_on_messaging_platform(tmp_path):
@@ -285,7 +285,7 @@ def test_supervisor_kills_term_resistant_descendant(tmp_path):
     log, events = tmp_path / "out.log", tmp_path / "events.log"
     pidfile = tmp_path / "child.pid"
     # leader exits at once; its child ignores SIGTERM and would be orphaned
-    script = f"(trap '' TERM; echo $$ > {pidfile}; exec sleep 60) & sleep 0.3; exit 0"
+    script = f"(trap '' TERM; exec sleep 60) & echo $! > {pidfile}; sleep 0.3; exit 0"
     core._default_spawn(["/bin/sh", "-c", script], log, 30, events, "sid3")
     for _ in range(200):
         if events.exists() and "relay_finished" in events.read_text():
@@ -325,3 +325,13 @@ def test_supervisor_records_exit(tmp_path):
     _t.sleep(0.2)
     row = _j.loads(events.read_text().splitlines()[-1])
     assert row["event"] == "relay_finished" and row["exit_code"] == 0 and log.read_text().strip() == "hi"
+
+
+def test_legacy_v020_successor_flag_still_blocks_relay(tmp_path):
+    import json as _j
+    d = tmp_path / "data"
+    d.mkdir()
+    (d / "state.json").write_text(_j.dumps({"sessions": {"old": {"successor": True, "seen": 1}}, "global": {}}))
+    eng, s, spawned, clock = make(tmp_path, mode="relay", relay_dry_run=False)
+    out = turn(eng, "old", 120_000, 10)
+    assert "/new" in out and eng.on_pre_llm_call(session_id="old") is None
