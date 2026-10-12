@@ -221,10 +221,15 @@ class Engine:
     def _load(self) -> None:
         try:
             raw = json.loads(self.state_file.read_text())
-            self.sessions = raw.get("sessions", {}) if isinstance(raw.get("sessions"), dict) else {}
-            self.glob = raw.get("global", {}) if isinstance(raw.get("global"), dict) else {}
             if not isinstance(raw, dict):
                 raise ValueError("state.json is not an object")
+            self.sessions = raw.get("sessions", {}) if isinstance(raw.get("sessions"), dict) else {}
+            self.glob = raw.get("global", {}) if isinstance(raw.get("global"), dict) else {}
+            # Migrate the v0.2.0 per-session successor flag into the unpruned list.
+            marks = self.glob.setdefault("successors", [])
+            for sid, st in self.sessions.items():
+                if isinstance(st, dict) and st.get("successor") and sid not in marks:
+                    marks.append(sid)
             self.broken = False
         except FileNotFoundError:
             self.sessions, self.glob, self.broken = {}, {}, False
@@ -479,6 +484,7 @@ with open(log_path, "ab") as out:
     try:
         p = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
     except Exception as e:
+        out.write(("handydandy: successor failed to start: %s\n" % e).encode())
         ev("relay_error", error="successor failed to start: %s" % e)
         sys.exit(1)
     def group_alive():

@@ -272,9 +272,9 @@ def test_successor_mark_survives_pruning(tmp_path, monkeypatch):
     monkeypatch.setenv(core.SUCCESSOR_ENV, "1")
     eng.on_pre_api_request(session_id="succ", approx_input_tokens=1, message_count=1, model="m")
     monkeypatch.delenv(core.SUCCESSOR_ENV)
-    for i in range(250):  # push it out of the 200 newest session records
+    for i in range(250):  # arming saves state, pushing it out of the 200 newest records
         clock.t += 1
-        turn(eng, f"n{i}", 10, 1)
+        turn(eng, f"n{i}", 120_000, 10)
     assert "succ" not in eng.sessions
     out = turn(eng, "succ", 120_000, 10)
     assert "/new" in out
@@ -335,3 +335,27 @@ def test_legacy_v020_successor_flag_still_blocks_relay(tmp_path):
     eng, s, spawned, clock = make(tmp_path, mode="relay", relay_dry_run=False)
     out = turn(eng, "old", 120_000, 10)
     assert "/new" in out and eng.on_pre_llm_call(session_id="old") is None
+
+
+def test_legacy_flag_survives_pruning_after_upgrade(tmp_path):
+    import json as _j
+    d = tmp_path / "data"
+    d.mkdir()
+    (d / "state.json").write_text(_j.dumps({"sessions": {"old": {"successor": True, "seen": 1}}, "global": {}}))
+    eng, s, spawned, clock = make(tmp_path, mode="relay", relay_dry_run=False)
+    for i in range(250):  # arming saves state, so these evict "old" from the 200 newest
+        clock.t += 1
+        turn(eng, f"n{i}", 120_000, 10)
+    assert "old" not in eng.sessions
+    assert "/new" in turn(eng, "old", 120_000, 10)
+
+
+def test_supervisor_writes_start_failure_into_linked_log(tmp_path):
+    import time as _t
+    log, events = tmp_path / "out.log", tmp_path / "events.log"
+    core._default_spawn([str(tmp_path / "missing-binary")], log, 30, events, "sid4")
+    for _ in range(100):
+        if events.exists() and "relay_error" in events.read_text():
+            break
+        _t.sleep(0.1)
+    assert "failed to start" in log.read_text()
