@@ -6,13 +6,16 @@ Hermes wiring lives in ``__init__.py``.
 from __future__ import annotations
 
 import csv
+import fcntl
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +38,7 @@ class Settings:
     relay_dry_run: bool = True
     relay_platforms: list = field(default_factory=lambda: ["cli", "tui", "desktop"])
     relay_cooldown_minutes: int = 30
+    relay_timeout_minutes: int = 20
     hermes_command: str = ""  # "" = first `hermes` on PATH
 
     @classmethod
@@ -57,6 +61,7 @@ class Settings:
             relay_dry_run=_as_bool(get("relay_dry_run", d.relay_dry_run), d.relay_dry_run),
             relay_platforms=_as_list(get("relay_platforms", None), d.relay_platforms),
             relay_cooldown_minutes=_as_int(get("relay_cooldown_minutes", d.relay_cooldown_minutes), d.relay_cooldown_minutes),
+            relay_timeout_minutes=_as_int(get("relay_timeout_minutes", d.relay_timeout_minutes), d.relay_timeout_minutes),
             hermes_command=str(get("hermes_command", d.hermes_command) or ""),
         )
         if s.mode not in MODES:
@@ -177,8 +182,17 @@ def successor_command(hermes: str, profile: str, name: str, query_file: Path) ->
     return cmd
 
 
+
+
 class Engine:
-    """Per-process state machine. One instance per plugin load."""
+    """State machine shared by every Hermes process on this profile.
+
+    Live counters (tokens, messages) stay in memory. Flags that must never repeat (armed,
+    handoff done, relay reserved, successor) live in state.json and are only changed inside
+    ``_txn()``, which holds a cross-process file lock and re-reads the file first.
+    """
+
+    LOCK_WAIT_S = 5.0
 
     def __init__(self, settings_fn: Callable[[], Settings], data_dir: Path, hermes_home: Path,
                  profile_fn: Callable[[], str],
@@ -192,31 +206,76 @@ class Engine:
         self.ctx_limit_fn = ctx_limit_fn
         self.spawn_fn = spawn_fn or _default_spawn
         self.clock = clock
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+        self.live: dict[str, dict] = {}
         self.sessions: dict[str, dict] = {}
+        self.glob: dict[str, Any] = {}
         self._ctx_cache: dict[tuple, Optional[int]] = {}
         self.state_file = self.data_dir / "state.json"
+        self.lock_file = self.data_dir / "state.lock"
         self.log_file = self.data_dir / "events.log"
         self._load()
 
     # ---- persistence -------------------------------------------------
     def _load(self) -> None:
         try:
-            self.sessions = json.loads(self.state_file.read_text()).get("sessions", {})
-        except Exception:
-            self.sessions = {}
+            raw = json.loads(self.state_file.read_text())
+            self.sessions = raw.get("sessions", {}) if isinstance(raw.get("sessions"), dict) else {}
+            self.glob = raw.get("global", {}) if isinstance(raw.get("global"), dict) else {}
+        except FileNotFoundError:
+            self.sessions, self.glob = {}, {}
+        except Exception as e:
+            # Keep the unreadable file for inspection; start clean.
+            try:
+                self.state_file.replace(self.state_file.with_suffix(f".corrupt-{int(self.clock())}"))
+            except Exception:
+                pass
+            self.log("state_unreadable", error=str(e))
+            self.sessions, self.glob = {}, {}
 
-    def _save(self) -> None:
+    def _save(self) -> bool:
         try:
             self.data_dir.mkdir(parents=True, exist_ok=True)
-            # keep the file small: newest 200 sessions
             items = sorted(self.sessions.items(), key=lambda kv: kv[1].get("seen", 0))[-200:]
             self.sessions = dict(items)
-            tmp = self.state_file.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"sessions": self.sessions}, indent=1))
+            tmp = self.state_file.with_name(f".state.{os.getpid()}.{threading.get_ident()}.tmp")
+            with tmp.open("w") as f:
+                json.dump({"sessions": self.sessions, "global": self.glob}, f, indent=1)
+                f.flush()
+                os.fsync(f.fileno())
             tmp.replace(self.state_file)
-        except Exception:
-            pass
+            return True
+        except Exception as e:
+            self.log("state_save_failed", error=str(e))
+            return False
+
+    @contextmanager
+    def _txn(self):
+        """Cross-process critical section. Yields True if the lock was taken (state reloaded)."""
+        with self.lock:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            fh = open(self.lock_file, "a+")
+            got = False
+            try:
+                deadline = time.monotonic() + self.LOCK_WAIT_S
+                while True:
+                    try:
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        got = True
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() > deadline:
+                            break
+                        time.sleep(0.05)
+                if got:
+                    self._load()
+                else:
+                    self.log("lock_timeout")
+                yield got
+            finally:
+                if got:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                fh.close()
 
     def log(self, event: str, **fields: Any) -> None:
         try:
@@ -239,15 +298,23 @@ class Engine:
         if not session_id:
             return
         with self.lock:
-            st = self._s(session_id)
-            st["tokens"] = _as_int(approx_input_tokens, st.get("tokens", 0))
-            st["messages"] = _as_int(message_count, st.get("messages", 0))
-            st["model"], st["provider"], st["base_url"] = model or "", provider or "", base_url or ""
+            lv = self.live.setdefault(session_id, {})
+            lv["tokens"] = _as_int(approx_input_tokens, lv.get("tokens", 0))
+            lv["messages"] = _as_int(message_count, lv.get("messages", 0))
+            lv["model"], lv["provider"], lv["base_url"] = model or "", provider or "", base_url or ""
+            first = not lv.get("checked_successor")
+            lv["checked_successor"] = True
+        # A session started by handydandy stays marked, even when resumed later without the env var.
+        if first and os.environ.get(SUCCESSOR_ENV) == "1":
+            with self._txn() as ok:
+                if ok and not self.sessions.get(session_id, {}).get("successor"):
+                    self._s(session_id)["successor"] = True
+                    self._save()
 
-    def _ctx_limit(self, st: dict, s: Settings) -> Optional[int]:
+    def _ctx_limit(self, lv: dict, s: Settings) -> Optional[int]:
         if s.context_limit > 0:
             return s.context_limit
-        key = (st.get("model", ""), st.get("provider", ""), st.get("base_url", ""))
+        key = (lv.get("model", ""), lv.get("provider", ""), lv.get("base_url", ""))
         if key not in self._ctx_cache:
             val = None
             if self.ctx_limit_fn and key[0]:
@@ -258,50 +325,60 @@ class Engine:
             self._ctx_cache[key] = val if isinstance(val, int) and val > 0 else None
         return self._ctx_cache[key]
 
+    def _is_successor(self, sid: str) -> bool:
+        return os.environ.get(SUCCESSOR_ENV) == "1" or bool(self.sessions.get(sid, {}).get("successor"))
+
     def on_transform_llm_output(self, response_text: str = "", session_id: str = "",
                                 platform: str = "", **_: Any) -> Optional[str]:
         """End of a turn, before delivery. Arms the session or fires the relay."""
         if not session_id or not isinstance(response_text, str):
             return None
         s = self.settings_fn()
-        successor = os.environ.get(SUCCESSOR_ENV) == "1"
-        mode = "advise" if successor and s.mode == "relay" else s.mode
         with self.lock:
+            lv = dict(self.live.get(session_id, {}))
+        with self._txn() as ok:
+            if not ok:
+                return None  # fail closed: no notice, no relay
+            mode = "advise" if self._is_successor(session_id) and s.mode == "relay" else s.mode
             st = self._s(session_id)
             st["platform"] = platform or st.get("platform", "")
             # 1) handoff written this turn -> log it, maybe relay
-            if st.get("armed_at") and not st.get("handoff_done") and mode in ("handoff", "relay"):
+            if st.get("armed_at") and not st.get("handoff_done") and st.get("mode") in ("handoff", "relay"):
+                mode = st["mode"] if mode != "advise" else "handoff"
                 hp = Path(st["handoff_path"])
-                if hp.exists() and hp.stat().st_mtime >= st["armed_at"] - 1:
-                    st["handoff_done"] = self.clock()
-                    extra = self._after_handoff(session_id, st, s, mode, hp)
-                    self._save()
-                    return response_text + extra if extra else None
+                if not _usable_handoff(hp, st["armed_at"]):
+                    return None
+                st["handoff_done"] = self.clock()
+                if not self._save():
+                    return None
+                extra = self._after_handoff(session_id, st, s, mode, hp)
+                self._save()
+                return response_text + extra
             # 2) not yet armed -> check thresholds
             if st.get("armed_at"):
                 return None
-            reasons = crossed(st.get("tokens", 0), st.get("messages", 0), self._ctx_limit(st, s), s)
+            reasons = crossed(lv.get("tokens", 0), lv.get("messages", 0), self._ctx_limit(lv, s), s)
             if not reasons:
                 return None
             hdir = Path(os.path.expanduser(s.handoff_dir)) if s.handoff_dir else self.hermes_home / "handoffs"
             hp = handoff_path(hdir, self.profile_fn(), session_id)
             st.update(armed_at=self.clock(), handoff_path=str(hp), reasons=reasons, mode=mode)
+            if not self._save():
+                return None
             self.log("armed", session_id=session_id, mode=mode, reasons=reasons, platform=platform,
                      handoff=str(hp))
-            self._save()
             return response_text + notice_text(mode, reasons, hp)
 
     def on_pre_llm_call(self, session_id: str = "", **_: Any) -> Optional[dict]:
-        s = self.settings_fn()
-        if s.mode not in ("handoff", "relay") or not session_id:
+        if not session_id or self.settings_fn().mode not in ("handoff", "relay"):
             return None
-        with self.lock:
+        with self._txn() as ok:
             st = self.sessions.get(session_id) or {}
-            if not st.get("armed_at") or st.get("handoff_done") or st.get("mode") == "advise":
+            if not ok or not st.get("armed_at") or st.get("handoff_done") or st.get("mode") == "advise":
                 return None
             return {"context": handoff_instruction(Path(st["handoff_path"]), st.get("reasons", []))}
 
-    # ---- relay -------------------------------------------------------
+    # ---- relay (called inside _txn) ------------------------------------
     def _after_handoff(self, sid: str, st: dict, s: Settings, mode: str, hp: Path) -> str:
         profile = self.profile_fn()
         if s.session_log_csv:
@@ -311,52 +388,92 @@ class Engine:
             except Exception as e:
                 self.log("csv_error", error=str(e))
         self.log("handoff_written", session_id=sid, handoff=str(hp))
+        manual = f"start a fresh session with: from handoff {hp}"
         if mode != "relay":
             return f"\n\n{NOTICE_MARK} Handoff saved. Start a fresh session with: from handoff {hp}"
         platform = (st.get("platform") or "").lower()
         if platform not in s.relay_platforms:
             self.log("relay_skipped", session_id=sid, reason=f"platform {platform!r} not allowed")
-            return (f"\n\n{NOTICE_MARK} Handoff saved. Automatic restart is off for this channel; "
-                    f"start a fresh session with: from handoff {hp}")
-        last = self._global_last_relay()
+            return f"\n\n{NOTICE_MARK} Handoff saved. Automatic restart is off for this channel; {manual}"
+        if st.get("relay_reserved"):
+            return f"\n\n{NOTICE_MARK} Handoff saved. A fresh session was already started for this one."
+        last = float(self.glob.get("last_relay", 0) or 0)
         if last and self.clock() - last < s.relay_cooldown_minutes * 60:
             self.log("relay_skipped", session_id=sid, reason="cooldown")
-            return f"\n\n{NOTICE_MARK} Handoff saved. Relay is cooling down; start a fresh session with: from handoff {hp}"
+            return f"\n\n{NOTICE_MARK} Handoff saved. Relay is cooling down; {manual}"
         name = f"handydandy-{_SAFE.sub('-', sid)[-24:]}"
         qf = self.data_dir / "prompts" / f"{name}.txt"
         qf.parent.mkdir(parents=True, exist_ok=True)
         qf.write_text(successor_prompt(hp))
         hermes = s.hermes_command or shutil.which("hermes") or "hermes"
         cmd = successor_command(hermes, profile, name, qf)
-        st["relay_name"] = name
         if s.relay_dry_run:
             self.log("relay_dry_run", session_id=sid, command=cmd)
             return (f"\n\n{NOTICE_MARK} Handoff saved. Dry run: a fresh session would start now with "
                     f"`{' '.join(cmd)}`. Start it yourself with: from handoff {hp}")
-        self._set_global_last_relay(self.clock())
+        # Reserve durably before spawning so a crash or a second process cannot launch twice.
+        st["relay_reserved"] = self.clock()
+        st["relay_name"] = name
+        self.glob["last_relay"] = self.clock()
+        if not self._save():
+            return f"\n\n{NOTICE_MARK} Handoff saved, but the relay could not be recorded safely; {manual}"
         try:
             out = self.data_dir / "relay-logs" / f"{name}.log"
             out.parent.mkdir(parents=True, exist_ok=True)
-            pid = self.spawn_fn(cmd, out)
-            self.log("relay_started", session_id=sid, command=cmd, pid=pid, log=str(out))
+            pid = self.spawn_fn(cmd, out, max(1, s.relay_timeout_minutes) * 60, self.log_file, sid)
+            st["relay_pid"] = pid
+            self.log("relay_started", session_id=sid, command=cmd, supervisor_pid=pid, log=str(out),
+                     timeout_minutes=s.relay_timeout_minutes)
         except Exception as e:
             self.log("relay_error", session_id=sid, error=str(e))
-            return f"\n\n{NOTICE_MARK} Handoff saved, but the fresh session failed to start. Start it with: from handoff {hp}"
+            return f"\n\n{NOTICE_MARK} Handoff saved, but the fresh session failed to start; {manual}"
         resume = f"hermes -p {profile} -c {name}" if profile and profile != "default" else f"hermes -c {name}"
         return f"\n\n{NOTICE_MARK} Handoff saved. A fresh session started from it. Continue there with: {resume}"
 
-    def _global_last_relay(self) -> float:
-        return float(self.sessions.get("__global__", {}).get("last_relay", 0) or 0)
 
-    def _set_global_last_relay(self, t: float) -> None:
-        self.sessions.setdefault("__global__", {})["last_relay"] = t
-        self.sessions["__global__"]["seen"] = t
+def _usable_handoff(hp: Path, armed_at: float) -> bool:
+    try:
+        st = hp.stat()
+    except OSError:
+        return False
+    return hp.is_file() and st.st_size > 0 and st.st_mtime >= armed_at - 1
 
 
-def _default_spawn(cmd: list[str], log_path: Path) -> int:
+# Runs as its own detached process: starts the successor in a new process group, waits up to the
+# timeout, kills the group if it overruns, and appends the outcome to events.log.
+_SUPERVISOR = r"""
+import json, os, signal, subprocess, sys, time
+from datetime import datetime
+cmd, log_path, timeout, events, sid = json.loads(sys.argv[1]), sys.argv[2], float(sys.argv[3]), sys.argv[4], sys.argv[5]
+def ev(event, **kw):
+    row = {"t": datetime.now().astimezone().isoformat(timespec="seconds"), "event": event, "session_id": sid, **kw}
+    with open(events, "a") as f:
+        f.write(json.dumps(row) + "\n")
+with open(log_path, "ab") as out:
+    p = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+    try:
+        code = p.wait(timeout=timeout)
+        ev("relay_finished", pid=p.pid, exit_code=code)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGTERM)
+            try:
+                p.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                os.killpg(p.pid, signal.SIGKILL)
+                p.wait()
+        except ProcessLookupError:
+            pass
+        ev("relay_timed_out", pid=p.pid, timeout_s=timeout)
+"""
+
+
+def _default_spawn(cmd: list[str], log_path: Path, timeout_s: float, events_log: Path, sid: str) -> int:
     env = dict(os.environ)
     env[SUCCESSOR_ENV] = "1"
-    f = open(log_path, "ab")
-    p = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env,
-                         start_new_session=True, cwd=os.getcwd())
+    p = subprocess.Popen(
+        [sys.executable, "-c", _SUPERVISOR, json.dumps(cmd), str(log_path), str(timeout_s), str(events_log), sid],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, env=env,
+        start_new_session=True, cwd=os.getcwd(),
+    )
     return p.pid

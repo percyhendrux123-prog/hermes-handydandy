@@ -1,5 +1,5 @@
 name: handydandy
-version: 0.1.0
+version: 0.2.0
 manifest_version: 2
 api_version: 1
 description: Sessions that hand off to themselves. Past a size limit the agent writes a handoff and (optionally) a fresh session starts from it.
@@ -8,6 +8,7 @@ license: MIT
 homepage: https://github.com/deployaxiom/handydandy
 tags: [sessions, handoff, context, compaction, productivity]
 requires_hermes: ">=0.21.4"
+platforms: [macos, linux]
 provides_hooks:
   - pre_api_request
   - transform_llm_output
@@ -64,6 +65,11 @@ config_schema:
     default: 30
     label: Relay cooldown (minutes)
     description: Minimum gap between automatic restarts across all sessions.
+  relay_timeout_minutes:
+    type: int
+    default: 20
+    label: Relay time limit (minutes)
+    description: A fresh session started by relay is stopped if it runs longer than this.
   hermes_command:
     type: str
     default: ""

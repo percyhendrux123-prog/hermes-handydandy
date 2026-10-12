@@ -33,7 +33,7 @@ def make(tmp_path, **overrides):
     clock = Clock()
     eng = core.Engine(lambda: s, tmp_path / "data", tmp_path / "home", lambda: "default",
                       ctx_limit_fn=lambda m, p, b: 200_000,
-                      spawn_fn=lambda cmd, log: spawned.append(cmd) or 4242, clock=clock)
+                      spawn_fn=lambda cmd, *a: spawned.append(cmd) or 4242, clock=clock)
     return eng, s, spawned, clock
 
 
@@ -110,7 +110,7 @@ def test_relay_dry_run_does_not_spawn(tmp_path):
     out, hp = _relay_to_handoff(eng, clock)
     assert "Dry run" in out and not spawned
     assert "relay_dry_run" in (tmp_path / "data" / "events.log").read_text()
-    assert not eng._global_last_relay()  # a dry run must not use up the cooldown
+    assert not eng.glob.get("last_relay")  # a dry run must not use up the cooldown
 
 
 def test_relay_live_spawns_named_successor(tmp_path):
@@ -162,3 +162,81 @@ def test_settings_from_getter_sanitizes():
     s = core.Settings.from_getter(lambda k, d: vals.get(k, d))
     assert s.mode == "advise" and s.max_messages == 7
     assert s.relay_platforms == ["cli", "desktop"] and s.relay_dry_run is False
+
+
+def test_empty_file_or_directory_is_not_a_handoff(tmp_path):
+    eng, s, spawned, clock = make(tmp_path, mode="relay", relay_dry_run=False)
+    turn(eng, "s1", 120_000, 10)
+    hp = Path(eng.sessions["s1"]["handoff_path"])
+    hp.mkdir(parents=True)  # a directory at the path
+    assert turn(eng, "s1", 121_000, 11) is None
+    hp.rmdir()
+    hp.write_text("")  # empty file
+    assert turn(eng, "s1", 122_000, 12) is None
+    assert not spawned and eng.on_pre_llm_call(session_id="s1")  # still asking for it
+
+
+def test_successor_mark_survives_resume_without_env(tmp_path, monkeypatch):
+    eng, s, spawned, clock = make(tmp_path, mode="relay", relay_dry_run=False)
+    monkeypatch.setenv(core.SUCCESSOR_ENV, "1")
+    eng.on_pre_api_request(session_id="succ", approx_input_tokens=10, message_count=2, model="m")
+    monkeypatch.delenv(core.SUCCESSOR_ENV)
+    # a later process resumes the successor session without the env var
+    eng2, *_ = make(tmp_path, mode="relay", relay_dry_run=False)
+    eng2.data_dir = eng.data_dir
+    eng2.state_file, eng2.lock_file, eng2.log_file = eng.state_file, eng.lock_file, eng.log_file
+    out = turn(eng2, "succ", 120_000, 10)
+    assert "/new" in out and eng2.on_pre_llm_call(session_id="succ") is None
+
+
+def test_two_processes_cannot_both_relay(tmp_path):
+    spawned = []
+    s = core.Settings(mode="relay", relay_dry_run=False, handoff_dir=str(tmp_path / "h"))
+    clock = Clock()
+    mk = lambda: core.Engine(lambda: s, tmp_path / "data", tmp_path / "home", lambda: "default",
+                             spawn_fn=lambda cmd, *a: spawned.append(cmd) or 1, clock=clock)
+    a, b = mk(), mk()
+    turn(a, "x", 120_000, 10)
+    turn(b, "y", 120_000, 10)
+    for eng, sid in ((a, "x"), (b, "y")):
+        hp = Path(eng.sessions[sid]["handoff_path"])
+        hp.parent.mkdir(parents=True, exist_ok=True)
+        hp.write_text("# h")
+    clock.t += 5
+    turn(a, "x", 121_000, 11)
+    out = turn(b, "y", 121_000, 11)  # b reloads state under the lock and sees a's reservation
+    assert len(spawned) == 1 and "cooling down" in out
+    assert turn(a, "x", 122_000, 12) is None  # never twice for one session
+
+
+def test_corrupt_state_is_set_aside(tmp_path):
+    d = tmp_path / "data"
+    d.mkdir()
+    (d / "state.json").write_text("{not json")
+    eng, *_ = make(tmp_path)
+    assert eng.sessions == {} and list(d.glob("state.corrupt-*"))
+
+
+def test_supervisor_kills_overrunning_successor(tmp_path):
+    import json as _j, time as _t
+    log, events = tmp_path / "out.log", tmp_path / "events.log"
+    pid = core._default_spawn(["/bin/sleep", "30"], log, 1, events, "sid1")
+    for _ in range(100):
+        if events.exists() and "relay_timed_out" in events.read_text():
+            break
+        _t.sleep(0.2)
+    row = _j.loads(events.read_text().splitlines()[-1])
+    assert row["event"] == "relay_timed_out" and row["session_id"] == "sid1"
+
+
+def test_supervisor_records_exit(tmp_path):
+    import json as _j, time as _t
+    log, events = tmp_path / "out.log", tmp_path / "events.log"
+    core._default_spawn(["/bin/echo", "hi"], log, 30, events, "sid2")
+    for _ in range(100):
+        if events.exists():
+            break
+        _t.sleep(0.1)
+    _t.sleep(0.2)
+    row = _j.loads(events.read_text().splitlines()[-1])
+    assert row["event"] == "relay_finished" and row["exit_code"] == 0 and log.read_text().strip() == "hi"
