@@ -113,12 +113,21 @@ def test_relay_dry_run_does_not_spawn(tmp_path):
     assert not eng.glob.get("last_relay")  # a dry run must not use up the cooldown
 
 
+def _fake_hermes(tmp_path):
+    exe = tmp_path / "bin" / "hermes"
+    exe.parent.mkdir(exist_ok=True)
+    exe.write_text("#!/bin/sh\nexit 0\n")
+    exe.chmod(0o755)
+    return str(exe)
+
+
 def test_relay_live_spawns_named_successor(tmp_path):
-    eng, s, spawned, clock = make(tmp_path, mode="relay", relay_dry_run=False, hermes_command="/x/hermes")
+    exe = _fake_hermes(tmp_path)
+    eng, s, spawned, clock = make(tmp_path, mode="relay", relay_dry_run=False, hermes_command=exe)
     out, hp = _relay_to_handoff(eng, clock)
     assert len(spawned) == 1
     cmd = spawned[0]
-    assert cmd[:2] == ["/x/hermes", "chat"] and "--create-if-missing" in cmd and "-p" not in cmd
+    assert cmd[:2] == [exe, "chat"] and "--create-if-missing" in cmd and "-p" not in cmd
     qf = Path(cmd[cmd.index("--query-file") + 1])
     assert qf.read_text().startswith(f"from handoff {hp}")
     assert "do not send messages" in qf.read_text()
@@ -209,12 +218,88 @@ def test_two_processes_cannot_both_relay(tmp_path):
     assert turn(a, "x", 122_000, 12) is None  # never twice for one session
 
 
-def test_corrupt_state_is_set_aside(tmp_path):
+def test_corrupt_state_fails_closed(tmp_path):
     d = tmp_path / "data"
     d.mkdir()
     (d / "state.json").write_text("{not json")
-    eng, *_ = make(tmp_path)
-    assert eng.sessions == {} and list(d.glob("state.corrupt-*"))
+    eng, *_ = make(tmp_path, mode="relay", relay_dry_run=False)
+    assert turn(eng, "s1", 500_000, 500) is None  # no notice, no relay
+    assert eng.on_pre_llm_call(session_id="s1") is None
+    assert (d / "state.json").read_text() == "{not json"  # left for a person to inspect
+    assert "state_unreadable" in (d / "events.log").read_text()
+    (d / "state.json").unlink()  # recovery: delete it
+    assert turn(eng, "s1", 500_000, 500)
+
+
+def test_missing_launcher_does_not_claim_a_restart(tmp_path):
+    eng, s, spawned, clock = make(tmp_path, mode="relay", relay_dry_run=False,
+                                  hermes_command=str(tmp_path / "nope" / "hermes"))
+    out, hp = _relay_to_handoff(eng, clock)
+    assert not spawned and "launcher was not found" in out and "started" not in out
+
+
+def test_switching_relay_to_handoff_stops_spawning(tmp_path):
+    exe = _fake_hermes(tmp_path)
+    eng, s, spawned, clock = make(tmp_path, mode="relay", relay_dry_run=False, hermes_command=exe)
+    turn(eng, "s1", 120_000, 10)
+    s.mode = "handoff"
+    hp = Path(eng.sessions["s1"]["handoff_path"])
+    hp.parent.mkdir(parents=True)
+    hp.write_text("# h")
+    clock.t += 5
+    out = turn(eng, "s1", 121_000, 11)
+    assert not spawned and "Handoff saved" in out
+
+
+def test_unreadable_handoff_is_not_accepted(tmp_path):
+    import os
+    if os.geteuid() == 0:
+        return
+    eng, s, spawned, clock = make(tmp_path, mode="handoff")
+    turn(eng, "s1", 120_000, 10)
+    hp = Path(eng.sessions["s1"]["handoff_path"])
+    hp.parent.mkdir(parents=True)
+    hp.write_text("# h")
+    hp.chmod(0)
+    try:
+        assert turn(eng, "s1", 121_000, 11) is None
+    finally:
+        hp.chmod(0o644)
+
+
+def test_successor_mark_survives_pruning(tmp_path, monkeypatch):
+    eng, s, spawned, clock = make(tmp_path, mode="relay", relay_dry_run=False)
+    monkeypatch.setenv(core.SUCCESSOR_ENV, "1")
+    eng.on_pre_api_request(session_id="succ", approx_input_tokens=1, message_count=1, model="m")
+    monkeypatch.delenv(core.SUCCESSOR_ENV)
+    for i in range(250):  # push it out of the 200 newest session records
+        clock.t += 1
+        turn(eng, f"n{i}", 10, 1)
+    assert "succ" not in eng.sessions
+    out = turn(eng, "succ", 120_000, 10)
+    assert "/new" in out
+
+
+def test_supervisor_kills_term_resistant_descendant(tmp_path):
+    import json as _j, os, time as _t
+    log, events = tmp_path / "out.log", tmp_path / "events.log"
+    pidfile = tmp_path / "child.pid"
+    # leader exits at once; its child ignores SIGTERM and would be orphaned
+    script = f"(trap '' TERM; echo $$ > {pidfile}; exec sleep 60) & sleep 0.3; exit 0"
+    core._default_spawn(["/bin/sh", "-c", script], log, 30, events, "sid3")
+    for _ in range(200):
+        if events.exists() and "relay_finished" in events.read_text():
+            break
+        _t.sleep(0.2)
+    row = _j.loads(events.read_text().splitlines()[-1])
+    assert row["event"] == "relay_finished" and row["cleaned_leftovers"] is True
+    child = int(pidfile.read_text())
+    try:
+        os.kill(child, 0)
+        alive = True
+    except ProcessLookupError:
+        alive = False
+    assert not alive
 
 
 def test_supervisor_kills_overrunning_successor(tmp_path):

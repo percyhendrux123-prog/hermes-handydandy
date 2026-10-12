@@ -214,6 +214,7 @@ class Engine:
         self.state_file = self.data_dir / "state.json"
         self.lock_file = self.data_dir / "state.lock"
         self.log_file = self.data_dir / "events.log"
+        self.broken = False
         self._load()
 
     # ---- persistence -------------------------------------------------
@@ -222,18 +223,20 @@ class Engine:
             raw = json.loads(self.state_file.read_text())
             self.sessions = raw.get("sessions", {}) if isinstance(raw.get("sessions"), dict) else {}
             self.glob = raw.get("global", {}) if isinstance(raw.get("global"), dict) else {}
+            if not isinstance(raw, dict):
+                raise ValueError("state.json is not an object")
+            self.broken = False
         except FileNotFoundError:
-            self.sessions, self.glob = {}, {}
+            self.sessions, self.glob, self.broken = {}, {}, False
         except Exception as e:
-            # Keep the unreadable file for inspection; start clean.
-            try:
-                self.state_file.replace(self.state_file.with_suffix(f".corrupt-{int(self.clock())}"))
-            except Exception:
-                pass
-            self.log("state_unreadable", error=str(e))
-            self.sessions, self.glob = {}, {}
+            # Fail closed: leave the file as it is and do nothing until a person fixes or deletes it.
+            if not self.broken:
+                self.log("state_unreadable", error=str(e), fix=f"inspect or delete {self.state_file}")
+            self.sessions, self.glob, self.broken = {}, {}, True
 
     def _save(self) -> bool:
+        if self.broken:
+            return False
         try:
             self.data_dir.mkdir(parents=True, exist_ok=True)
             items = sorted(self.sessions.items(), key=lambda kv: kv[1].get("seen", 0))[-200:]
@@ -271,7 +274,7 @@ class Engine:
                     self._load()
                 else:
                     self.log("lock_timeout")
-                yield got
+                yield got and not self.broken
             finally:
                 if got:
                     fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
@@ -302,14 +305,19 @@ class Engine:
             lv["tokens"] = _as_int(approx_input_tokens, lv.get("tokens", 0))
             lv["messages"] = _as_int(message_count, lv.get("messages", 0))
             lv["model"], lv["provider"], lv["base_url"] = model or "", provider or "", base_url or ""
-            first = not lv.get("checked_successor")
-            lv["checked_successor"] = True
+            pending = not lv.get("successor_saved")
         # A session started by handydandy stays marked, even when resumed later without the env var.
-        if first and os.environ.get(SUCCESSOR_ENV) == "1":
+        if pending and os.environ.get(SUCCESSOR_ENV) == "1":
             with self._txn() as ok:
-                if ok and not self.sessions.get(session_id, {}).get("successor"):
-                    self._s(session_id)["successor"] = True
-                    self._save()
+                if ok:
+                    marks = self.glob.setdefault("successors", [])
+                    if session_id not in marks:
+                        marks.append(session_id)
+                        del marks[:-5000]
+                        ok = self._save()
+                    if ok:
+                        with self.lock:
+                            self.live.setdefault(session_id, {})["successor_saved"] = True
 
     def _ctx_limit(self, lv: dict, s: Settings) -> Optional[int]:
         if s.context_limit > 0:
@@ -326,7 +334,7 @@ class Engine:
         return self._ctx_cache[key]
 
     def _is_successor(self, sid: str) -> bool:
-        return os.environ.get(SUCCESSOR_ENV) == "1" or bool(self.sessions.get(sid, {}).get("successor"))
+        return os.environ.get(SUCCESSOR_ENV) == "1" or sid in self.glob.get("successors", [])
 
     def on_transform_llm_output(self, response_text: str = "", session_id: str = "",
                                 platform: str = "", **_: Any) -> Optional[str]:
@@ -339,12 +347,14 @@ class Engine:
         with self._txn() as ok:
             if not ok:
                 return None  # fail closed: no notice, no relay
-            mode = "advise" if self._is_successor(session_id) and s.mode == "relay" else s.mode
+            successor = self._is_successor(session_id)
+            mode = "advise" if successor and s.mode == "relay" else s.mode
             st = self._s(session_id)
             st["platform"] = platform or st.get("platform", "")
             # 1) handoff written this turn -> log it, maybe relay
             if st.get("armed_at") and not st.get("handoff_done") and st.get("mode") in ("handoff", "relay"):
-                mode = st["mode"] if mode != "advise" else "handoff"
+                # The current settings decide whether to spawn; the session must never be a successor.
+                mode = "relay" if (s.mode == "relay" and not successor) else "handoff"
                 hp = Path(st["handoff_path"])
                 if not _usable_handoff(hp, st["armed_at"]):
                     return None
@@ -395,7 +405,7 @@ class Engine:
         if platform not in s.relay_platforms:
             self.log("relay_skipped", session_id=sid, reason=f"platform {platform!r} not allowed")
             return f"\n\n{NOTICE_MARK} Handoff saved. Automatic restart is off for this channel; {manual}"
-        if st.get("relay_reserved"):
+        if st.get("relay_reserved") or sid in self.glob.get("relayed", []):
             return f"\n\n{NOTICE_MARK} Handoff saved. A fresh session was already started for this one."
         last = float(self.glob.get("last_relay", 0) or 0)
         if last and self.clock() - last < s.relay_cooldown_minutes * 60:
@@ -407,6 +417,10 @@ class Engine:
         qf.write_text(successor_prompt(hp))
         hermes = s.hermes_command or shutil.which("hermes") or "hermes"
         cmd = successor_command(hermes, profile, name, qf)
+        launcher = shutil.which(hermes)
+        if not s.relay_dry_run and not launcher:
+            self.log("relay_error", session_id=sid, error=f"hermes launcher not found or not executable: {hermes}")
+            return f"\n\n{NOTICE_MARK} Handoff saved, but the Hermes launcher was not found; {manual}"
         if s.relay_dry_run:
             self.log("relay_dry_run", session_id=sid, command=cmd)
             return (f"\n\n{NOTICE_MARK} Handoff saved. Dry run: a fresh session would start now with "
@@ -415,6 +429,9 @@ class Engine:
         st["relay_reserved"] = self.clock()
         st["relay_name"] = name
         self.glob["last_relay"] = self.clock()
+        relayed = self.glob.setdefault("relayed", [])
+        relayed.append(sid)
+        del relayed[:-5000]
         if not self._save():
             return f"\n\n{NOTICE_MARK} Handoff saved, but the relay could not be recorded safely; {manual}"
         try:
@@ -436,7 +453,13 @@ def _usable_handoff(hp: Path, armed_at: float) -> bool:
         st = hp.stat()
     except OSError:
         return False
-    return hp.is_file() and st.st_size > 0 and st.st_mtime >= armed_at - 1
+    if not (hp.is_file() and st.st_size > 0 and st.st_mtime >= armed_at - 1):
+        return False
+    try:
+        with hp.open("rb") as f:
+            return bool(f.read(1))
+    except OSError:
+        return False
 
 
 # Runs as its own detached process: starts the successor in a new process group, waits up to the
@@ -450,20 +473,40 @@ def ev(event, **kw):
     with open(events, "a") as f:
         f.write(json.dumps(row) + "\n")
 with open(log_path, "ab") as out:
-    p = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+    try:
+        p = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+    except Exception as e:
+        ev("relay_error", error="successor failed to start: %s" % e)
+        sys.exit(1)
+    def group_alive():
+        try:
+            os.killpg(p.pid, 0)
+            return True
+        except (ProcessLookupError, PermissionError):
+            return False
+    def clean_group():
+        # TERM the whole group, wait out a grace period, then KILL whatever is left.
+        for sig, grace in ((signal.SIGTERM, 15), (signal.SIGKILL, 5)):
+            try:
+                os.killpg(p.pid, sig)
+            except ProcessLookupError:
+                return
+            end = time.time() + grace
+            while time.time() < end:
+                try:
+                    p.wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    pass
+                if not group_alive():
+                    return
     try:
         code = p.wait(timeout=timeout)
-        ev("relay_finished", pid=p.pid, exit_code=code)
+        leftover = group_alive()
+        if leftover:
+            clean_group()
+        ev("relay_finished", pid=p.pid, exit_code=code, cleaned_leftovers=leftover)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(p.pid, signal.SIGTERM)
-            try:
-                p.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                os.killpg(p.pid, signal.SIGKILL)
-                p.wait()
-        except ProcessLookupError:
-            pass
+        clean_group()
         ev("relay_timed_out", pid=p.pid, timeout_s=timeout)
 """
 
