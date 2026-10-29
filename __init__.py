@@ -1,8 +1,7 @@
-"""HandyDandy: sessions that hand off to themselves.
+"""HandyDandy: session-size notices and structured handoffs.
 
 Watches session size after every turn. Past the limit it tells you (advise), has the
-agent write a handoff (handoff), or writes the handoff and starts a fresh session from
-it (relay). See README.md.
+agent write a handoff (handoff). You start the next session yourself. See README.md.
 """
 from __future__ import annotations
 
@@ -32,13 +31,6 @@ def _data_dir() -> Path:
         return _hermes_home() / "plugin-data" / PLUGIN_ID
 
 
-def _ctx_limit(model: str, provider: str, base_url: str):
-    # Read-only lookup of the model's context window. Optional: on failure the
-    # percentage check is skipped and the token/message limits still apply.
-    from agent.model_metadata import get_model_context_length  # type: ignore
-    return get_model_context_length(model, base_url=base_url or "", provider=provider or "")
-
-
 def register(ctx):
     def settings() -> Settings:
         return Settings.from_getter(lambda k, d: ctx.get_config(k, d))
@@ -49,7 +41,7 @@ def register(ctx):
         except Exception:
             return "default"
 
-    engine = Engine(settings, _data_dir(), _hermes_home(), profile, ctx_limit_fn=_ctx_limit)
+    engine = Engine(settings, _data_dir(), _hermes_home(), profile)
 
     def pre_api_request(**kw):
         try:
