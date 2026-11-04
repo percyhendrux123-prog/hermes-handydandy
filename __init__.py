@@ -1,8 +1,4 @@
-"""HandyDandy: session-size notices and structured handoffs.
-
-Watches session size after every turn. Past the limit it tells you (advise), has the
-agent write a handoff (handoff). You start the next session yourself. See README.md.
-"""
+"""HandyDandy: session-size notices, structured handoffs and opt-in gateway carryover."""
 from __future__ import annotations
 
 import logging
@@ -41,7 +37,8 @@ def register(ctx):
         except Exception:
             return "default"
 
-    engine = Engine(settings, _data_dir(), _hermes_home(), profile)
+    owner_profile = profile()
+    engine = Engine(settings, _data_dir(), _hermes_home(), lambda: owner_profile)
 
     def pre_api_request(**kw):
         try:
@@ -63,6 +60,21 @@ def register(ctx):
             logger.debug("handydandy pre_llm_call failed", exc_info=True)
             return None
 
+    async def pre_gateway_dispatch(**kw):
+        try:
+            await engine.on_pre_gateway_dispatch(**{**kw, "active_profile": profile()})
+        except Exception:
+            logger.debug("handydandy pre_gateway_dispatch failed; inbound unchanged", exc_info=True)
+        return None
+
+    def on_session_reset(**kw):
+        try:
+            engine.on_session_reset(**kw)
+        except Exception:
+            logger.debug("handydandy on_session_reset failed", exc_info=True)
+
+    ctx.register_hook("pre_gateway_dispatch", pre_gateway_dispatch)
+    ctx.register_hook("on_session_reset", on_session_reset)
     ctx.register_hook("pre_api_request", pre_api_request)
     ctx.register_hook("transform_llm_output", transform_llm_output)
     ctx.register_hook("pre_llm_call", pre_llm_call)

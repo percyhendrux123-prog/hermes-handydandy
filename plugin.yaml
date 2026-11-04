@@ -1,25 +1,27 @@
 name: handydandy
-version: 0.3.0
+version: 0.4.0
 manifest_version: 2
 api_version: 1
-description: Session-size notices and structured handoffs. You start the next session yourself.
+description: Session-size notices, structured handoffs, and opt-in automatic gateway carryover.
 author: Deploy Axiom
 license: MIT
 homepage: https://github.com/percyhendrux123-prog/hermes-handydandy
 tags: [sessions, handoff, context, compaction, productivity]
-requires_hermes: ">=0.22.5"
+requires_hermes: ">=0.22.2"
 platforms: [macos, linux]
 provides_hooks:
+  - pre_gateway_dispatch
+  - on_session_reset
   - pre_api_request
   - transform_llm_output
   - pre_llm_call
 config_schema:
   mode:
     type: str
-    choices: [advise, handoff]
+    choices: [advise, handoff, carryover]
     default: advise
     label: Mode
-    description: "advise = one notice; handoff = the agent writes a handoff file for you to open in a new session."
+    description: "advise = one notice; handoff = manual restart from a handoff; carryover = the next gateway message starts fresh after a bounded handoff is ready."
   max_input_tokens:
     type: int
     default: 100000

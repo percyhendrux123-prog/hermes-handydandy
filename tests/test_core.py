@@ -393,7 +393,8 @@ def test_registered_hooks_use_explicit_settings_without_metadata_lookup(tmp_path
 
     ctx = Context()
     plugin.register(ctx)
-    assert set(ctx.hooks) == {"pre_api_request", "transform_llm_output", "pre_llm_call"}
+    assert set(ctx.hooks) == {"pre_api_request", "transform_llm_output", "pre_llm_call",
+                              "pre_gateway_dispatch", "on_session_reset"}
     ctx.hooks["pre_api_request"](session_id="demo", approx_input_tokens=110_000, message_count=10,
                                  model="unknown", provider="custom", base_url="https://invalid.example")
     out = ctx.hooks["transform_llm_output"](session_id="demo", response_text="answer", platform="cli")
