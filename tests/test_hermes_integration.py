@@ -79,7 +79,7 @@ def test_real_hermes_reset_and_timer_plugin(tmp_path, monkeypatch, timer_first):
     monkeypatch.setattr(runner, "_is_user_authorized_for_source", lambda *a, **k: True, raising=False)
 
     timer_path = Path(os.environ["RESET_POLICY_ROOT"]) / "__init__.py"
-    spec = importlib.util.spec_from_file_location("a213_timer", timer_path)
+    spec = importlib.util.spec_from_file_location("hd_timer", timer_path)
     timer = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(timer)
     monkeypatch.setattr(timer, "_read_session_reset_policy", lambda profile: {

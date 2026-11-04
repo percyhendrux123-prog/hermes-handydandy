@@ -2,7 +2,7 @@
 
 Run the unit cases with the repo venv and PYTHONPATH=<repo>/tests.
 Host cases additionally need the supplied stable snapshot and existing host libs.
-Regression cases authored by the codereview profile during A213 pass 1.
+Regression cases from adversarial review.
 """
 import asyncio
 import json
@@ -70,7 +70,7 @@ def test_active_deferral_does_not_discard_new_work(tmp_path):
 
 def test_registered_hook_handles_unstamped_owning_named_profile(tmp_path, monkeypatch):
     root = core.Path(core.__file__).parent
-    spec = importlib.util.spec_from_file_location('a213_registered_probe', root / '__init__.py',
+    spec = importlib.util.spec_from_file_location('hd_registered_probe', root / '__init__.py',
                                                  submodule_search_locations=[str(root)])
     plugin = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = plugin

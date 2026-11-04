@@ -1,6 +1,6 @@
-# A213 verification evidence
+# Verification evidence (0.4.0)
 
-Local candidate: HandyDandy 0.4.0, branch `a213-carryover`, based on `7cc035707f18590db3957fbcc73e3e4064bc8f38` (0.3.0). No deployed build, installed-plugin update, public push, tag, release or opened catalog PR. Candidate commit is supplied in the task handoff; this file does not embed its own commit hash.
+HandyDandy 0.4.0, based on 0.3.0 (`7cc035707f18590db3957fbcc73e3e4064bc8f38`). All results below were produced before publication.
 
 ## Source/runtime matrix
 
@@ -59,8 +59,8 @@ The worker used Python 3.14.9 with existing read-only Hermes dependency site-pac
 ## Catalog checks
 
 ```bash
-hermes plugins validate /Users/percykeith/dev/handydandy --install-deps
-hermes plugins doctor /Users/percykeith/dev/handydandy --ci
+hermes plugins validate . --install-deps
+hermes plugins doctor . --ci
 git diff --check
 ```
 
@@ -94,7 +94,7 @@ This host-isolation note is material: carryover requires in-process plugin execu
 Observed doctor output (exit 0):
 
 ```text
-Plugin Doctor: /Users/percykeith/dev/handydandy
+Plugin Doctor: .
   manifest: handydandy 0.4.0 (standalone)
   OK: runtime discovery, manifest parsing, import, and registration passed
   registrations: 0 tool(s), 5 hook(s)
@@ -106,4 +106,3 @@ Plugin Doctor: /Users/percykeith/dev/handydandy
 
 Mandatory codereview-profile adversarial findings/fixes and final rerun results are supplied in the structured task handoff. Passing tests/validation is not a catalog-maintainer acceptance decision. The private full-reset seam may still need a public API before admission.
 
-Percy approved catalog submission via AXIOM during this task. AXIOM performs the final client-data check and opens it after build review. This worker only prepares `docs/CATALOG-SUBMISSION.md` and a local commit. Its entry SHA placeholder is intentionally invalid until AXIOM pins the approved public commit.

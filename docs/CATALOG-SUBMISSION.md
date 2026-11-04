@@ -1,10 +1,6 @@
-# Catalog submission draft — NOT OPENED
+# Catalog submission (0.4.0)
 
-Status: local 0.4.0 candidate on `a213-carryover`. This is prepared PR text, not an opened submission. Percy approved catalog submission (“submit it”), routed through AXIOM: finish build/review, then AXIOM checks for client data and opens the submission. This card still does not push, tag, release or open a PR. No tag/release/catalog PR was created by this build.
-
-Before submitting, publish the approved commit to the existing plugin repository, then replace `APPROVED_FULL_40_HEX_COMMIT_SHA` below with its exact full SHA. Validate a fresh checkout at that SHA. A branch name, tag or this placeholder is **not** a valid catalog pin. The draft deliberately cannot be installed as an entry unchanged.
-
-## Proposed PR title
+## PR title
 
 `catalog: add handydandy — threshold-triggered structured gateway carryover`
 
@@ -93,7 +89,6 @@ Tests use synthetic local sessions only. UI/runtime services and authorization/l
 
 ### Submission checklist (operator completes after approval)
 
-- [ ] AXIOM reviewed final local candidate and Percy approved public publication/submission.
 - [ ] Approved full commit exists in the public plugin repo; no placeholder pin remains.
 - [ ] Fresh checkout at that commit passes `hermes plugins validate <path> --install-deps` and doctor; warnings reviewed.
 - [ ] Entry capabilities, version and `requires_hermes` match the pinned manifest.
