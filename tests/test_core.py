@@ -180,6 +180,29 @@ def test_environment_can_supply_legacy_mode(monkeypatch):
     assert s.mode == "handoff" and s.context_limit == 200_000
 
 
+def test_config_wins_and_env_is_a_deprecated_fallback_warned_once(monkeypatch, caplog):
+    import logging
+    monkeypatch.setattr(core, "_env_warned", False)
+    monkeypatch.setenv("HANDYDANDY_MODE", "advise")
+    monkeypatch.setenv("HANDYDANDY_MAX_MESSAGES", "9")
+    config = {"mode": "handoff"}
+    with caplog.at_level(logging.WARNING):
+        s = core.Settings.from_getter(lambda k, d: config.get(k, d))
+        again = core.Settings.from_getter(lambda k, d: config.get(k, d))
+    assert s.mode == "handoff" and s.max_messages == 9  # config set mode; env filled the rest
+    assert again.max_messages == 9
+    warnings = [r.getMessage() for r in caplog.records if "deprecated" in r.getMessage()]
+    assert len(warnings) == 1 and "HANDYDANDY_MAX_MESSAGES" in warnings[0]
+    assert "HANDYDANDY_MODE" not in warnings[0]
+
+
+def test_no_environment_means_no_deprecation_warning(monkeypatch, caplog):
+    monkeypatch.setattr(core, "_env_warned", False)
+    s = core.Settings.from_getter(lambda k, d: {"max_messages": 5}.get(k, d))
+    assert s.max_messages == 5 and s.mode == "advise"
+    assert not caplog.records
+
+
 def test_empty_file_or_directory_is_not_a_handoff(tmp_path):
     eng, *_ = make(tmp_path, mode="handoff")
     turn(eng, "s1", 120_000, 10)
@@ -393,8 +416,7 @@ def test_registered_hooks_use_explicit_settings_without_metadata_lookup(tmp_path
 
     ctx = Context()
     plugin.register(ctx)
-    assert set(ctx.hooks) == {"pre_api_request", "transform_llm_output", "pre_llm_call",
-                              "pre_gateway_dispatch", "on_session_reset"}
+    assert set(ctx.hooks) == {"pre_api_request", "transform_llm_output", "pre_llm_call"}
     ctx.hooks["pre_api_request"](session_id="demo", approx_input_tokens=110_000, message_count=10,
                                  model="unknown", provider="custom", base_url="https://invalid.example")
     out = ctx.hooks["transform_llm_output"](session_id="demo", response_text="answer", platform="cli")
